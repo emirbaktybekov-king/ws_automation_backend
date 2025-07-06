@@ -1,9 +1,7 @@
 import puppeteer, { Browser, Page, ElementHandle } from "puppeteer";
 import { v4 as uuidv4 } from "uuid";
 
-export async function launchWhatsAppSession(
-  pageUpdateCallback: (data: { sessionId: string; status: string }) => void
-): Promise<{
+export async function launchWhatsAppSession(): Promise<{
   sessionId: string;
   browser: Browser;
   page: Page;
@@ -30,7 +28,6 @@ export async function launchWhatsAppSession(
       canvas = await page.$(qrCodeSelector);
       if (canvas) {
         console.log("QR code canvas found");
-        pageUpdateCallback({ sessionId, status: "QR code loaded" });
         break;
       }
       throw new Error("QR code canvas not found");
@@ -54,58 +51,14 @@ export async function launchWhatsAppSession(
 
   // Extract QR code as data URL
   const qrCode = await canvas.evaluate((el) => {
-    return (el as HTMLCanvasElement).toDataURL("image/png");
+    const dataUrl = (el as HTMLCanvasElement).toDataURL("image/png");
+    console.log("QR code extracted:", dataUrl.substring(0, 50) + "..."); // Debug log
+    return dataUrl;
   });
 
   if (!qrCode) {
     await browser.close();
     throw new Error("Failed to extract QR code");
-  }
-
-  // Poll for QR code disappearance
-  const continueButtonSelector =
-    "#app > div > span:nth-child(3) > div > div > div > div > div > div > div.x78zum5.x8hhl5t.x13a6bvl.xp4054r.xuxw1ft.x1cnzs8.x1xnnf8n.xx6bls6.x106a9eq.x16w0wmm > div > button";
-  let isScanned = false;
-  const maxPollAttempts = 60; // 120 seconds total
-  let pollAttempts = 0;
-
-  while (!isScanned && pollAttempts < maxPollAttempts) {
-    try {
-      const canvasCheck = await page.$(qrCodeSelector);
-      if (!canvasCheck) {
-        console.log("QR code canvas disappeared, likely scanned");
-        isScanned = true;
-        try {
-          await page.waitForSelector(continueButtonSelector, {
-            timeout: 30000,
-          });
-          await page.click(continueButtonSelector);
-          console.log("Continue button clicked");
-          pageUpdateCallback({ sessionId, status: "Connected" });
-        } catch (error) {
-          console.error("Failed to click Continue button:", error);
-          pageUpdateCallback({
-            sessionId,
-            status: "Error: Failed to click Continue button",
-          });
-        }
-      } else {
-        console.log("QR code canvas still present, polling...");
-        pollAttempts++;
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-      }
-    } catch (error) {
-      console.error("Error during QR code polling:", error);
-      pollAttempts++;
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-    }
-  }
-
-  if (!isScanned) {
-    console.log("QR code scan timeout after 120 seconds");
-    pageUpdateCallback({ sessionId, status: "Error: QR code scan timeout" });
-    await browser.close();
-    throw new Error("QR code scan timeout");
   }
 
   return { sessionId, browser, page, qrCode };

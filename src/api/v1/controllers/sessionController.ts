@@ -14,24 +14,8 @@ export const createSession = async (
   }
 
   try {
-    const { sessionId, qrCode } = await launchWhatsAppSession((data) => {
-      const ws = wsClients.get(data.sessionId);
-      if (ws && ws.readyState === ws.OPEN) {
-        ws.send(
-          JSON.stringify({ sessionId: data.sessionId, status: data.status })
-        );
-      }
-      if (data.status === "Connected") {
-        prisma.whatsAppSessions
-          .update({
-            where: { sessionId: data.sessionId },
-            data: { botStepStatus: "AUTHENTICATED" },
-          })
-          .catch((error) =>
-            console.error("Failed to update session status:", error)
-          );
-      }
-    });
+    const { sessionId, qrCode } = await launchWhatsAppSession();
+    console.log("Sending QR code to client:", qrCode.substring(0, 50) + "..."); // Debug log
     const session = await prisma.whatsAppSessions.create({
       data: {
         userId,
