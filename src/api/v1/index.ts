@@ -1,8 +1,15 @@
 import { Router } from "express";
+import type { WebSocket as WsWebSocket } from "ws";
 import authRoutes from "./routes/authRoutes";
+import sessionRoutes from "./routes/sessionRoutes";
 
-const router = Router();
+export default function v1Routes(wsClients: Map<string, WsWebSocket>) {
+  const router = Router();
 
-router.use("/auth", authRoutes);
+  router.use("/auth", authRoutes);
 
-export default router;
+  // Предполагаем, что sessionRoutes — это функция, принимающая wsClients и возвращающая Router
+  router.use("/session", sessionRoutes(wsClients));
+
+  return router;
+}

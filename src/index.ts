@@ -1,4 +1,4 @@
-import express, { Express, Request, Response } from "express";
+import express, { Express } from "express";
 import { WebSocketServer } from "ws";
 import dotenv from "dotenv";
 import cors from "cors";
@@ -9,7 +9,6 @@ dotenv.config();
 const app: Express = express();
 const port = process.env.PORT || 8000;
 
-// Enable CORS for the frontend origin
 app.use(
   cors({
     origin: [
@@ -24,11 +23,13 @@ app.use(
   })
 );
 
-// Handle preflight OPTIONS requests for all routes
 app.options("*", cors());
 
 app.use(express.json());
-app.use("/api/v1", v1Routes);
+
+// Создаём Map для хранения клиентов WS с правильным типом
+import type { WebSocket as WsWebSocket } from "ws";
+const wsClients = new Map<string, WsWebSocket>();
 
 const server = app.listen(port, () => {
   console.log(`Server running at http://localhost:${port}`);
@@ -36,14 +37,33 @@ const server = app.listen(port, () => {
 
 const wss = new WebSocketServer({ server });
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws: WsWebSocket) => {
   console.log("WebSocket client connected");
+
   ws.on("message", (message) => {
-    console.log("Received:", message.toString());
+    try {
+      const data = JSON.parse(message.toString());
+      if (data.sessionId) {
+        wsClients.set(data.sessionId, ws);
+        console.log(`Registered WebSocket for session: ${data.sessionId}`);
+      }
+    } catch (e) {
+      console.error("Invalid WS message", e);
+    }
   });
+
   ws.on("close", () => {
     console.log("WebSocket client disconnected");
+    for (const [sessionId, client] of wsClients.entries()) {
+      if (client === ws) {
+        wsClients.delete(sessionId);
+        break;
+      }
+    }
   });
 });
+
+// Используем функцию для создания роутов, передаём wsClients
+app.use("/api/v1", v1Routes(wsClients));
 
 export default app;

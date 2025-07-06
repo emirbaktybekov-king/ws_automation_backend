@@ -7,11 +7,26 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum BotStepStatus {
+  QRCODE
+  AUTHENTICATED
+}
+
 model User {
-  id        Int      @id @default(autoincrement())
+  id        String   @id @default(uuid())
   email     String   @unique
   password  String
   username  String
+  sessions  WhatsAppSessions[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model WhatsAppSessions {
+  id             String         @id @default(uuid())
+  userId         String
+  sessionId      String         @unique
+  botStepStatus  BotStepStatus  @default(QRCODE)
+  user           User           @relation(fields: [userId], references: [id])
+  createdAt      DateTime       @default(now())
 }

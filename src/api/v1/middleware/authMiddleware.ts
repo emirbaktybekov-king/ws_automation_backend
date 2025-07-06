@@ -14,7 +14,7 @@ export const authMiddleware = (
   const token = authHeader.split(" ")[1];
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET!) as {
-      id: number;
+      id: string;
       email: string;
     };
     req.user = decoded;
@@ -27,7 +27,7 @@ export const authMiddleware = (
 declare global {
   namespace Express {
     interface Request {
-      user?: { id: number; email: string };
+      user?: { id: string; email: string };
     }
   }
 }
