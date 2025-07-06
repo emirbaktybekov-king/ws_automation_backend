@@ -1,6 +1,6 @@
-import prisma from "@/lib/prismaClient";
 import { Request, Response } from "express";
 import jwt from "jsonwebtoken";
+import prisma from "@/lib/prismaClient";
 
 interface RegisterRequest {
   email: string;
@@ -20,12 +20,12 @@ interface RefreshRequest {
 const generateTokens = (user: { id: number; email: string }) => {
   const accessToken = jwt.sign(
     { id: user.id, email: user.email },
-    process.env.JWT_ACCESS_SECRET!,
+    process.env.JWT_SECRET!,
     { expiresIn: "5h" }
   );
   const refreshToken = jwt.sign(
     { id: user.id, email: user.email },
-    process.env.JWT_REFRESH_SECRET!,
+    process.env.JWT_SECRET!,
     { expiresIn: "30d" }
   );
   return { accessToken, refreshToken };
@@ -74,10 +74,7 @@ export const refresh = async (req: Request, res: Response) => {
   const { refreshToken } = req.body as RefreshRequest;
 
   try {
-    const decoded = jwt.verify(
-      refreshToken,
-      process.env.JWT_REFRESH_SECRET!
-    ) as {
+    const decoded = jwt.verify(refreshToken, process.env.JWT_SECRET!) as {
       id: number;
       email: string;
     };
