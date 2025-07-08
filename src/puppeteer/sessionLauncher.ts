@@ -1,7 +1,12 @@
 import puppeteer, { Browser, Page, ElementHandle } from "puppeteer";
 import { v4 as uuidv4 } from "uuid";
+import cssSelectors from "../data/cssSelectors.json";
+import { WebSocket } from "ws";
+import prisma from "@/lib/prismaClient";
 
-export async function launchWhatsAppSession(): Promise<{
+export async function launchWhatsAppSession(
+  wsClients: Map<string, WebSocket>
+): Promise<{
   sessionId: string;
   browser: Browser;
   page: Page;
@@ -15,9 +20,8 @@ export async function launchWhatsAppSession(): Promise<{
   const page = await browser.newPage();
   await page.goto("https://web.whatsapp.com", { waitUntil: "networkidle2" });
 
-  // QR code selector
-  const qrCodeSelector =
-    "#app > div > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.x1nhvcw1.xdt5ytf.x1dr59a3.xw2csxc.x1odjw0f.xyinxu5.xp48ta0.x1g2khh7.xtssl2i.xp9ttsr.x6s0dn4.x9f619.xdounpk.x1hql6x6.xe4h88v.x1g96xxu.x1t470q2 > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.xgpatz3.xeuugli.x2lwn1j.xl56j7k.xdt5ytf.x6s0dn4 > div:nth-child(2) > div > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.xe93d63.xeuugli.x2lwn1j.x1nhvcw1.xdt5ytf.x1cy8zhl > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.xeuugli.x2lwn1j.x1nhvcw1.x1q0g3np.x1cy8zhl.xkh2ocl.x6s0dn4.x1qughib.xi32cqo.x1qgv0r9.x18t01z2.xr3inr3 > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.xeuugli.x2lwn1j.xl56j7k.xdt5ytf.x6s0dn4.x1n2onr6.x1y8v6su.x1eq81zi > div > div > canvas";
+  // Use selector from JSON
+  const qrCodeSelector = cssSelectors.qrCodeSelector;
 
   // Attempt to find QR code canvas with timeout
   let canvas: ElementHandle<Element> | null = null;
@@ -43,9 +47,7 @@ export async function launchWhatsAppSession(): Promise<{
     });
   } else {
     // Fallback: Capture the QR code area as a screenshot
-    const qrArea = await page.$(
-      "#app > div > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.x1nhvcw1.xdt5ytf.x1dr59a3.xw2csxc.x1odjw0f.xyinxu5.xp48ta0.x1g2khh7.xtssl2i.xp9ttsr.x6s0dn4.x9f619.xdounpk.x1hql6x6.xe4h88v.x1g96xxu.x1t470q2 > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.xgpatz3.xeuugli.x2lwn1j.xl56j7k.xdt5ytf.x6s0dn4"
-    );
+    const qrArea = await page.$(cssSelectors.qrAreaSelector);
     if (qrArea) {
       qrCode = await qrArea.screenshot({ encoding: "base64", type: "png" });
       qrCode = `data:image/png;base64,${qrCode}`;
@@ -59,14 +61,173 @@ export async function launchWhatsAppSession(): Promise<{
     }
   }
 
+  // Monitor QR code scan
+  const monitorScan = async () => {
+    let attempts = 0;
+    const maxAttempts = 12; // 60 seconds total (5s * 12)
+    while (attempts < maxAttempts) {
+      try {
+        const qrStillPresent = await page.$(qrCodeSelector);
+        if (!qrStillPresent) {
+          console.log(`QR code scanned for session ${sessionId}`);
+          // Update session status to AUTHENTICATED
+          await prisma.whatsAppSessions.update({
+            where: { sessionId },
+            data: { botStepStatus: "AUTHENTICATED" },
+          });
+          console.log(`Session ${sessionId} updated to AUTHENTICATED`);
+
+          // Notify frontend of scan
+          const ws = wsClients.get(sessionId);
+          if (ws) {
+            ws.send(
+              JSON.stringify({
+                sessionId,
+                status: "AUTHENTICATED",
+                message: "Fetching chats...",
+              })
+            );
+            console.log(
+              `Notified frontend for session ${sessionId}: Fetching chats...`
+            );
+          }
+
+          // Wait 5 seconds before attempting to click Continue
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+
+          // Retry clicking the Continue button
+          let continueButton: ElementHandle<Element> | null = null;
+          let buttonAttempts = 0;
+          const maxButtonAttempts = 5; // Try for 10 seconds (2s * 5)
+          while (buttonAttempts < maxButtonAttempts) {
+            try {
+              await page.waitForSelector(
+                cssSelectors.welcomeModalContinueButtonSelector,
+                { timeout: 2000 }
+              );
+              continueButton = await page.$(
+                cssSelectors.welcomeModalContinueButtonSelector
+              );
+              if (continueButton) {
+                await continueButton.click();
+                console.log(`Clicked Continue button for session ${sessionId}`);
+                break;
+              }
+            } catch (error) {
+              console.log(
+                `Continue button not found for session ${sessionId}, attempt ${buttonAttempts + 1}`
+              );
+              try {
+                await page.evaluate((xpath) => {
+                  const element = document.evaluate(
+                    xpath,
+                    document,
+                    null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE,
+                    null
+                  ).singleNodeValue;
+                  if (element) {
+                    (element as HTMLElement).click();
+                  }
+                }, cssSelectors.welcomeModalContinueButtonXPath);
+                console.log(
+                  `Clicked Continue button via XPath for session ${sessionId}`
+                );
+                break;
+              } catch (xpathError) {
+                console.log(
+                  `XPath click failed for session ${sessionId}:`,
+                  xpathError
+                );
+              }
+            }
+            buttonAttempts++;
+            await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait 2s before retry
+          }
+
+          if (!continueButton) {
+            console.error(
+              `Failed to click Continue button after ${maxButtonAttempts} attempts for session ${sessionId}`
+            );
+          }
+
+          // Fetch top 10 chats
+          try {
+            await page.waitForSelector(
+              "#pane-side > div:nth-child(2) > div > div",
+              { timeout: 10000 }
+            );
+            const chats = await page.evaluate(() => {
+              const chatElements = document.querySelectorAll(
+                "#pane-side > div:nth-child(2) > div > div > div.x10l6tqk.xh8yej3.x1g42fcv[role='listitem']"
+              );
+              const chatList: { id: string; name: string; image: string }[] =
+                [];
+              chatElements.forEach((element, index) => {
+                if (index >= 10) return; // Limit to 10 chats
+                const id = element.getAttribute("data-id") || `chat-${index}`;
+                const nameElement = element.querySelector("span[title]");
+                const name = nameElement
+                  ? nameElement.getAttribute("title") || "Unknown"
+                  : "Unknown";
+                const imageElement = element.querySelector("img");
+                const image = imageElement
+                  ? imageElement.src
+                  : "https://placehold.co/600x400";
+                chatList.push({ id, name, image });
+              });
+              return chatList;
+            });
+            console.log(
+              `Fetched ${chats.length} chats for session ${sessionId}`
+            );
+
+            // Notify frontend via WebSocket
+            if (ws) {
+              ws.send(
+                JSON.stringify({
+                  sessionId,
+                  status: "AUTHENTICATED",
+                  message: "Chats loaded",
+                  chats,
+                })
+              );
+              console.log(
+                `Notified frontend for session ${sessionId}: Chats loaded`
+              );
+            }
+          } catch (error) {
+            console.error(
+              `Failed to fetch chats for session ${sessionId}:`,
+              error
+            );
+          }
+          break;
+        }
+      } catch (error) {
+        console.error(
+          `Error monitoring QR code scan for session ${sessionId}:`,
+          error
+        );
+      }
+      attempts++;
+      await new Promise((resolve) => setTimeout(resolve, 5000)); // Check every 5 seconds
+    }
+  };
+
+  // Start monitoring in the background
+  monitorScan().catch((err) =>
+    console.error(`Monitor scan error for session ${sessionId}:`, err)
+  );
+
   return { sessionId, browser, page, qrCode };
 }
 
 export async function refreshWhatsAppPage(page: Page): Promise<string> {
   await page.reload({ waitUntil: "networkidle2" });
 
-  const qrCodeSelector =
-    "#app > div > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.x1nhvcw1.xdt5ytf.x1dr59a3.xw2csxc.x1odjw0f.xyinxu5.xp48ta0.x1g2khh7.xtssl2i.xp9ttsr.x6s0dn4.x9f619.xdounpk.x1hql6x6.xe4h88v.x1g96xxu.x1t470q2 > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.xgpatz3.xeuugli.x2lwn1j.xl56j7k.xdt5ytf.x6s0dn4 > div:nth-child(2) > div > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.xe93d63.xeuugli.x2lwn1j.x1nhvcw1.xdt5ytf.x1cy8zhl > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.xeuugli.x2lwn1j.x1nhvcw1.x1q0g3np.x1cy8zhl.xkh2ocl.x6s0dn4.x1qughib.xi32cqo.x1qgv0r9.x18t01z2.xr3inr3 > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.xeuugli.x2lwn1j.xl56j7k.xdt5ytf.x6s0dn4.x1n2onr6.x1y8v6su.x1eq81zi > div > div > canvas";
+  // Use selector from JSON
+  const qrCodeSelector = cssSelectors.qrCodeSelector;
 
   let canvas: ElementHandle<Element> | null = null;
   try {
@@ -87,9 +248,7 @@ export async function refreshWhatsAppPage(page: Page): Promise<string> {
       return dataUrl;
     });
   } else {
-    const qrArea = await page.$(
-      "#app > div > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.x1nhvcw1.xdt5ytf.x1dr59a3.xw2csxc.x1odjw0f.xyinxu5.xp48ta0.x1g2khh7.xtssl2i.xp9ttsr.x6s0dn4.x9f619.xdounpk.x1hql6x6.xe4h88v.x1g96xxu.x1t470q2 > div.x1c4vz4f.xs83m0k.xdl72j9.x1g77sc7.x78zum5.xozqiw3.x1oa3qoh.x12fk4p8.xgpatz3.xeuugli.x2lwn1j.xl56j7k.xdt5ytf.x6s0dn4"
-    );
+    const qrArea = await page.$(cssSelectors.qrAreaSelector);
     if (qrArea) {
       qrCode = await qrArea.screenshot({ encoding: "base64", type: "png" });
       qrCode = `data:image/png;base64,${qrCode}`;
