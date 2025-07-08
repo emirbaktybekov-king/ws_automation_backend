@@ -5,7 +5,8 @@ import { WebSocket } from "ws";
 import prisma from "@/lib/prismaClient";
 
 export async function launchWhatsAppSession(
-  wsClients: Map<string, WebSocket>
+  wsClients: Map<string, WebSocket>,
+  sessions: Map<string, { browser: Browser; page: Page }>
 ): Promise<{
   sessionId: string;
   browser: Browser;
@@ -19,6 +20,9 @@ export async function launchWhatsAppSession(
   });
   const page = await browser.newPage();
   await page.goto("https://web.whatsapp.com", { waitUntil: "networkidle2" });
+
+  // Store session in global sessions Map
+  sessions.set(sessionId, { browser, page });
 
   // Use selector from JSON
   const qrCodeSelector = cssSelectors.qrCodeSelector;
@@ -57,6 +61,7 @@ export async function launchWhatsAppSession(
       );
     } else {
       await browser.close();
+      sessions.delete(sessionId);
       throw new Error("Failed to capture QR code area");
     }
   }
@@ -77,18 +82,22 @@ export async function launchWhatsAppSession(
           });
           console.log(`Session ${sessionId} updated to AUTHENTICATED`);
 
-          // Notify frontend of scan
-          const ws = wsClients.get(sessionId);
-          if (ws) {
-            ws.send(
-              JSON.stringify({
-                sessionId,
-                status: "AUTHENTICATED",
-                message: "Fetching chats...",
-              })
-            );
+          // Wait for loading element to disappear
+          try {
+            await page.waitForSelector(cssSelectors.loadingChatsSelector, {
+              timeout: 10000,
+            });
+            await page.waitForSelector(cssSelectors.loadingChatsSelector, {
+              hidden: true,
+              timeout: 30000,
+            });
             console.log(
-              `Notified frontend for session ${sessionId}: Fetching chats...`
+              `Loading chats element disappeared for session ${sessionId}`
+            );
+          } catch (error) {
+            console.log(
+              `Loading chats element not found or did not disappear for session ${sessionId}:`,
+              error
             );
           }
 
@@ -182,20 +191,49 @@ export async function launchWhatsAppSession(
               `Fetched ${chats.length} chats for session ${sessionId}`
             );
 
-            // Notify frontend via WebSocket
-            if (ws) {
-              ws.send(
-                JSON.stringify({
-                  sessionId,
-                  status: "AUTHENTICATED",
-                  message: "Chats loaded",
-                  chats,
-                })
-              );
-              console.log(
-                `Notified frontend for session ${sessionId}: Chats loaded`
-              );
-            }
+            // Notify frontend via WebSocket with retries
+            let wsAttempts = 0;
+            const maxWsAttempts = 5;
+            const sendWsMessage = async () => {
+              const ws = wsClients.get(sessionId);
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({
+                    sessionId,
+                    status: "AUTHENTICATED",
+                    message: "Fetching chats...",
+                  })
+                );
+                console.log(
+                  `Notified frontend for session ${sessionId}: Fetching chats...`
+                );
+                if (chats.length > 0) {
+                  ws.send(
+                    JSON.stringify({
+                      sessionId,
+                      status: "AUTHENTICATED",
+                      message: "Chats loaded",
+                      chats,
+                    })
+                  );
+                  console.log(
+                    `Notified frontend for session ${sessionId}: Chats loaded`
+                  );
+                }
+              } else if (wsAttempts < maxWsAttempts) {
+                console.log(
+                  `WebSocket client not ready for session ${sessionId}, retrying attempt ${wsAttempts + 1}`
+                );
+                wsAttempts++;
+                await new Promise((resolve) => setTimeout(resolve, 1000));
+                await sendWsMessage();
+              } else {
+                console.error(
+                  `Failed to send WebSocket message for session ${sessionId} after ${maxWsAttempts} attempts`
+                );
+              }
+            };
+            await sendWsMessage();
           } catch (error) {
             console.error(
               `Failed to fetch chats for session ${sessionId}:`,

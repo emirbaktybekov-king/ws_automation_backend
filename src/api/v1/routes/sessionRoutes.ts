@@ -1,12 +1,10 @@
 import { Router } from "express";
-import {
-  createSession,
-  refreshSession,
-} from "../controllers/sessionController";
+import { WebSocket } from "ws";
+import { Browser, Page } from "puppeteer";
+import { createSession, refreshSession, getSession } from "../controllers/sessionController";
 import { authMiddleware } from "../middleware/authMiddleware";
-import type { WebSocket } from "ws";
 
-export default function sessionRoutes(wsClients: Map<string, WebSocket>) {
+export default function sessionRoutes(wsClients: Map<string, WebSocket>, sessions: Map<string, { browser: Browser; page: Page }>) {
   const router = Router();
 
   router.post("/create", authMiddleware, (req, res) =>
@@ -14,6 +12,9 @@ export default function sessionRoutes(wsClients: Map<string, WebSocket>) {
   );
   router.post("/refresh", authMiddleware, (req, res) =>
     refreshSession(req, res, wsClients)
+  );
+  router.get("/:id", authMiddleware, (req, res) =>
+    getSession(req, res)
   );
 
   return router;
