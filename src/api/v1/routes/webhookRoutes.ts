@@ -4,6 +4,8 @@ import type { WebSocket } from "ws";
 import { Browser, Page } from "puppeteer";
 import dotenv from "dotenv";
 import path from "path";
+import fs from "fs";
+import placeholderData from "../../../data/placeholderData.json";
 
 // Load environment variables from .env file in project root
 
@@ -100,39 +102,32 @@ export default function webhookRoutes(
   sessions: Map<string, { browser: Browser; page: Page }>
 ) {
   // GET /api/v1/whatsapp_bot/webhook/:instance (requires api_key in query)
+
   router.get("/webhook/:instance", async (req: Request, res: Response) => {
     try {
       const instance = req.params.instance;
-      const apiKeyFromQuery = req.query.api_key;
+      const apiKeyFromQuery = req.query.api_key as string;
 
-      // Check api_key from query string
-      if (!apiKeyFromQuery || apiKeyFromQuery !== API_KEY) {
-        return res.status(403).json({ error: "Invalid or missing api_key" });
+      const instanceData = (placeholderData as any)[instance];
+
+      if (!instanceData) {
+        return res
+          .status(404)
+          .json({ error: `Instance '${instance}' not found` });
       }
 
-      const randomCaption =
-        captions[Math.floor(Math.random() * captions.length)];
-      const randomThumbnail =
-        thumbnailUrls[Math.floor(Math.random() * thumbnailUrls.length)];
+      if (!apiKeyFromQuery || apiKeyFromQuery !== instanceData.api_key) {
+        return res
+          .status(403)
+          .json({ error: "Invalid or missing API key for this instance" });
+      }
 
-      const response = {
+      const { api_key, ...filteredData } = instanceData; // do not expose api_key in response
+
+      res.status(200).json({
         instance,
-        typeWebhook: "incomingMessageReceived",
-        messageData: {
-          typeMessage: "imageMessage",
-          imageMessageData: {
-            downloadUrl: "https://url-to-image",
-            caption: randomCaption,
-            jpegThumbnail: randomThumbnail,
-            mimeType: "image/jpeg",
-          },
-        },
-        senderData: {
-          chatId: generateChatId(),
-        },
-      };
-
-      res.status(200).json(response);
+        ...filteredData,
+      });
     } catch (err: any) {
       console.error(
         `Webhook GET error for instance ${req.params.instance}:`,

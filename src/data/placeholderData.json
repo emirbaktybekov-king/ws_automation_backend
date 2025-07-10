@@ -1,0 +1,53 @@
+{
+  "instance1": {
+    "api_key": "key-aktan-123",
+    "user": "Aktan",
+    "typeWebhook": "incomingMessageReceived",
+    "messageData": {
+      "typeMessage": "imageMessage",
+      "imageMessageData": {
+        "downloadUrl": "https://url-to-image",
+        "caption": "Вот фото моего заказа #12345, проверьте, пожалуйста!",
+        "jpegThumbnail": "https://placehold.co/50x50",
+        "mimeType": "image/jpeg"
+      }
+    },
+    "senderData": {
+      "chatId": "9965551010101@c.us"
+    }
+  },
+  "instance2": {
+    "api_key": "key-ermek-456",
+    "user": "Ermek",
+    "typeWebhook": "incomingMessageReceived",
+    "messageData": {
+      "typeMessage": "imageMessage",
+      "imageMessageData": {
+        "downloadUrl": "https://url-to-image",
+        "caption": "Посмотрите, как выглядит продукт, можно заменить?",
+        "jpegThumbnail": "https://placehold.co/48x48",
+        "mimeType": "image/jpeg"
+      }
+    },
+    "senderData": {
+      "chatId": "9965552020202@c.us"
+    }
+  },
+  "instance3": {
+    "api_key": "key-emir-789",
+    "user": "Emir",
+    "typeWebhook": "incomingMessageReceived",
+    "messageData": {
+      "typeMessage": "imageMessage",
+      "imageMessageData": {
+        "downloadUrl": "https://url-to-image",
+        "caption": "Сфотографировал дефект на изделии, что делать?",
+        "jpegThumbnail": "https://placehold.co/60x60",
+        "mimeType": "image/jpeg"
+      }
+    },
+    "senderData": {
+      "chatId": "9965553030303@c.us"
+    }
+  }
+}
