@@ -3,17 +3,19 @@ import { v4 as uuidv4 } from "uuid";
 import cssSelectors from "../data/cssSelectors.json";
 import { WebSocket } from "ws";
 import prisma from "@/lib/prismaClient";
+import Redis from "ioredis";
 
 export async function launchWhatsAppSession(
   wsClients: Map<string, WebSocket>,
-  sessions: Map<string, { browser: Browser; page: Page }>
+  redis: Redis,
+  existingSessionId?: string
 ): Promise<{
   sessionId: string;
   browser: Browser;
   page: Page;
   qrCode: string;
 }> {
-  const sessionId = uuidv4();
+  const sessionId = existingSessionId || uuidv4();
   const browser = await puppeteer.launch({
     headless: false,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
@@ -21,49 +23,69 @@ export async function launchWhatsAppSession(
   const page = await browser.newPage();
   await page.goto("https://web.whatsapp.com", { waitUntil: "networkidle2" });
 
-  // Store session in global sessions Map
-  sessions.set(sessionId, { browser, page });
+  // Store minimal session metadata in Redis
+  const sessionData = {
+    sessionId,
+    userId: "", // Will be set in createSession
+    botStepStatus: "QRCODE",
+  };
+  await redis.set(
+    `whatsapp:session:${sessionId}`,
+    JSON.stringify(sessionData),
+    "EX",
+    3600 // Expire after 1 hour
+  );
 
   // Use selector from JSON
   const qrCodeSelector = cssSelectors.qrCodeSelector;
+  let qrCode: string | undefined;
 
   // Attempt to find QR code canvas with timeout
   let canvas: ElementHandle<Element> | null = null;
-  try {
-    await page.waitForSelector(qrCodeSelector, { timeout: 30000 });
-    canvas = await page.$(qrCodeSelector);
-    if (!canvas) {
-      console.log("QR code canvas not found, capturing available content");
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await page.waitForSelector(qrCodeSelector, { timeout: 10000 });
+      canvas = await page.$(qrCodeSelector);
+      if (canvas) {
+        qrCode = await canvas.evaluate((el) => {
+          const dataUrl = (el as HTMLCanvasElement).toDataURL("image/png");
+          console.log("QR code extracted:", dataUrl.substring(0, 50) + "...");
+          return dataUrl;
+        });
+        break;
+      } else {
+        console.log(
+          `QR code canvas not found on attempt ${attempt}, capturing screenshot`
+        );
+        const qrArea = await page.$(cssSelectors.qrAreaSelector);
+        if (qrArea) {
+          qrCode = await qrArea.screenshot({ encoding: "base64", type: "png" });
+          qrCode = `data:image/png;base64,${qrCode}`;
+          console.log(
+            "QR code screenshot captured:",
+            qrCode.substring(0, 50) + "..."
+          );
+          break;
+        }
+      }
+    } catch (error) {
+      console.error(
+        `Attempt ${attempt} to capture QR code for session ${sessionId} failed:`,
+        error
+      );
+      if (attempt === 3) {
+        await browser.close();
+        await redis.del(`whatsapp:session:${sessionId}`);
+        throw new Error("Failed to capture QR code area after 3 attempts");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
-  } catch (error) {
-    console.log(
-      "QR code canvas not immediately available, proceeding to capture"
-    );
   }
 
-  // Extract QR code as data URL (fallback to screenshot if canvas not found)
-  let qrCode: string;
-  if (canvas) {
-    qrCode = await canvas.evaluate((el) => {
-      const dataUrl = (el as HTMLCanvasElement).toDataURL("image/png");
-      console.log("QR code extracted:", dataUrl.substring(0, 50) + "..."); // Debug log
-      return dataUrl;
-    });
-  } else {
-    // Fallback: Capture the QR code area as a screenshot
-    const qrArea = await page.$(cssSelectors.qrAreaSelector);
-    if (qrArea) {
-      qrCode = await qrArea.screenshot({ encoding: "base64", type: "png" });
-      qrCode = `data:image/png;base64,${qrCode}`;
-      console.log(
-        "QR code screenshot captured:",
-        qrCode.substring(0, 50) + "..."
-      );
-    } else {
-      await browser.close();
-      sessions.delete(sessionId);
-      throw new Error("Failed to capture QR code area");
-    }
+  if (!qrCode) {
+    await browser.close();
+    await redis.del(`whatsapp:session:${sessionId}`);
+    throw new Error("Failed to capture QR code area");
   }
 
   // Monitor QR code scan
@@ -75,7 +97,14 @@ export async function launchWhatsAppSession(
         const qrStillPresent = await page.$(qrCodeSelector);
         if (!qrStillPresent) {
           console.log(`QR code scanned for session ${sessionId}`);
-          // Update session status to AUTHENTICATED
+          // Update session status in Redis and Prisma
+          sessionData.botStepStatus = "AUTHENTICATED";
+          await redis.set(
+            `whatsapp:session:${sessionId}`,
+            JSON.stringify(sessionData),
+            "EX",
+            3600
+          );
           await prisma.whatsAppSessions.update({
             where: { sessionId },
             data: { botStepStatus: "AUTHENTICATED" },
@@ -100,9 +129,6 @@ export async function launchWhatsAppSession(
               error
             );
           }
-
-          // Wait 5 seconds before attempting to click Continue
-          await new Promise((resolve) => setTimeout(resolve, 5000));
 
           // Retry clicking the Continue button
           let continueButton: ElementHandle<Element> | null = null;
@@ -151,7 +177,7 @@ export async function launchWhatsAppSession(
               }
             }
             buttonAttempts++;
-            await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait 2s before retry
+            await new Promise((resolve) => setTimeout(resolve, 2000));
           }
 
           if (!continueButton) {
@@ -173,7 +199,7 @@ export async function launchWhatsAppSession(
               const chatList: { id: string; name: string; image: string }[] =
                 [];
               chatElements.forEach((element, index) => {
-                if (index >= 10) return; // Limit to 10 chats
+                if (index >= 10) return;
                 const id = element.getAttribute("data-id") || `chat-${index}`;
                 const nameElement = element.querySelector("span[title]");
                 const name = nameElement
@@ -249,7 +275,7 @@ export async function launchWhatsAppSession(
         );
       }
       attempts++;
-      await new Promise((resolve) => setTimeout(resolve, 5000)); // Check every 5 seconds
+      await new Promise((resolve) => setTimeout(resolve, 5000));
     }
   };
 
@@ -264,39 +290,50 @@ export async function launchWhatsAppSession(
 export async function refreshWhatsAppPage(page: Page): Promise<string> {
   await page.reload({ waitUntil: "networkidle2" });
 
-  // Use selector from JSON
   const qrCodeSelector = cssSelectors.qrCodeSelector;
+  let qrCode: string | undefined;
 
   let canvas: ElementHandle<Element> | null = null;
-  try {
-    await page.waitForSelector(qrCodeSelector, { timeout: 30000 });
-    canvas = await page.$(qrCodeSelector);
-  } catch (error) {
-    console.log("QR code canvas not found on refresh, capturing screenshot");
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await page.waitForSelector(qrCodeSelector, { timeout: 10000 });
+      canvas = await page.$(qrCodeSelector);
+      if (canvas) {
+        qrCode = await canvas.evaluate((el) => {
+          const dataUrl = (el as HTMLCanvasElement).toDataURL("image/png");
+          console.log(
+            "Refreshed QR code extracted:",
+            dataUrl.substring(0, 50) + "..."
+          );
+          return dataUrl;
+        });
+        break;
+      } else {
+        console.log(`QR code canvas not found on refresh, attempt ${attempt}`);
+        const qrArea = await page.$(cssSelectors.qrAreaSelector);
+        if (qrArea) {
+          qrCode = await qrArea.screenshot({ encoding: "base64", type: "png" });
+          qrCode = `data:image/png;base64,${qrCode}`;
+          console.log(
+            "Refreshed QR code screenshot captured:",
+            qrCode.substring(0, 50) + "..."
+          );
+          break;
+        }
+      }
+    } catch (error) {
+      console.error(`QR code refresh attempt ${attempt} failed:`, error);
+      if (attempt === 3) {
+        throw new Error(
+          "Failed to capture refreshed QR code area after 3 attempts"
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
   }
 
-  let qrCode: string;
-  if (canvas) {
-    qrCode = await canvas.evaluate((el) => {
-      const dataUrl = (el as HTMLCanvasElement).toDataURL("image/png");
-      console.log(
-        "Refreshed QR code extracted:",
-        dataUrl.substring(0, 50) + "..."
-      );
-      return dataUrl;
-    });
-  } else {
-    const qrArea = await page.$(cssSelectors.qrAreaSelector);
-    if (qrArea) {
-      qrCode = await qrArea.screenshot({ encoding: "base64", type: "png" });
-      qrCode = `data:image/png;base64,${qrCode}`;
-      console.log(
-        "Refreshed QR code screenshot captured:",
-        qrCode.substring(0, 50) + "..."
-      );
-    } else {
-      throw new Error("Failed to capture refreshed QR code area");
-    }
+  if (!qrCode) {
+    throw new Error("Failed to capture refreshed QR code area");
   }
 
   return qrCode;
