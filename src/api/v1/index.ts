@@ -7,7 +7,7 @@ import healthRoutes from "./routes/healthRoutes";
 import webhookRoutes from "./routes/webhookRoutes";
 
 export default function v1Routes(
-  wsClients: Map<string, WebSocket>,
+  wsClients: Map<string, Set<WebSocket>>,
   redis: Redis
 ) {
   const router = Router();

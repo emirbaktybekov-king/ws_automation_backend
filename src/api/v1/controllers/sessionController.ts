@@ -2,15 +2,12 @@ import { Request, Response } from "express";
 import { WebSocket } from "ws";
 import prisma from "@/lib/prismaClient";
 import Redis from "ioredis";
-import {
-  launchWhatsAppSession,
-  refreshWhatsAppPage,
-} from "@/puppeteer/sessionLauncher";
+import { launchWhatsAppSession, refreshWhatsAppPage } from "@/puppeteer/sessionLauncher";
 
 export const createSession = async (
   req: Request,
   res: Response,
-  wsClients: Map<string, WebSocket>,
+  wsClients: Map<string, Set<WebSocket>>,
   redis: Redis
 ) => {
   const userId = req.user?.id;
@@ -20,30 +17,22 @@ export const createSession = async (
   }
 
   try {
-    // Fetch and clean up all existing QRCODE sessions for the user
     const existingSessions = await prisma.whatsAppSessions.findMany({
       where: { userId, botStepStatus: "QRCODE" },
     });
 
-    // Delete sessions from Redis and Prisma
     for (const existingSession of existingSessions) {
       try {
         await redis.del(`whatsapp:session:${existingSession.sessionId}`);
         await prisma.whatsAppSessions.delete({
           where: { id: existingSession.id },
         });
-        console.log(
-          `Deleted existing session ${existingSession.sessionId} from database and Redis`
-        );
+        console.log(`Deleted existing session ${existingSession.sessionId} from database and Redis`);
       } catch (err) {
-        console.error(
-          `Failed to delete existing session ${existingSession.sessionId}:`,
-          err
-        );
+        console.error(`Failed to delete existing session ${existingSession.sessionId}:`, err);
       }
     }
 
-    // Create new session
     let sessionData;
     const maxRetries = 5;
     let attempt = 0;
@@ -53,10 +42,7 @@ export const createSession = async (
         break;
       } catch (error) {
         attempt++;
-        console.error(
-          `Session creation attempt ${attempt} failed for userId ${userId}:`,
-          error
-        );
+        console.error(`Session creation attempt ${attempt} failed for userId ${userId}:`, error);
         if (attempt === maxRetries) {
           throw new Error(`Max retries reached for session creation: ${error}`);
         }
@@ -68,13 +54,9 @@ export const createSession = async (
       throw new Error("Failed to create session after retries");
     }
 
-    const { sessionId, browser, page, qrCode } = sessionData;
-    console.log(
-      `Created new session ${sessionId} for userId ${userId}, QR code:`,
-      qrCode.substring(0, 50) + "..."
-    );
+    const { sessionId, qrCode } = sessionData;
+    console.log(`Created new session ${sessionId} for userId ${userId}, QR code: ${qrCode.substring(0, 50)}...`);
 
-    // Create new session in Prisma
     const session = await prisma.whatsAppSessions.create({
       data: {
         userId,
@@ -83,7 +65,6 @@ export const createSession = async (
       },
     });
 
-    // Update Redis with userId
     const redisSession = { sessionId, userId, botStepStatus: "QRCODE" };
     await redis.set(
       `whatsapp:session:${sessionId}`,
@@ -91,9 +72,6 @@ export const createSession = async (
       "EX",
       3600
     );
-
-    // Close Puppeteer instance to avoid memory leaks
-    await browser.close();
 
     res.status(201).json({ sessionId: session.sessionId, qrCode });
   } catch (error) {
@@ -105,7 +83,7 @@ export const createSession = async (
 export const refreshSession = async (
   req: Request,
   res: Response,
-  wsClients: Map<string, WebSocket>,
+  wsClients: Map<string, Set<WebSocket>>,
   redis: Redis
 ) => {
   const { sessionId } = req.body;
@@ -121,67 +99,37 @@ export const refreshSession = async (
       where: { sessionId },
     });
     if (!dbSession) {
-      console.error(
-        `Session ${sessionId} not found in database for userId ${userId}`
-      );
+      console.error(`Session ${sessionId} not found in database for userId ${userId}`);
       return res.status(404).json({ error: "Session not found" });
     }
-    // Recreate session
     try {
-      const {
-        sessionId: newSessionId,
-        browser,
-        page,
-        qrCode,
-      } = await launchWhatsAppSession(wsClients, redis);
+      const { sessionId: newSessionId, qrCode } = await launchWhatsAppSession(wsClients, redis);
       await prisma.whatsAppSessions.update({
         where: { id: dbSession.id },
         data: { sessionId: newSessionId, botStepStatus: "QRCODE" },
       });
       await redis.set(
         `whatsapp:session:${newSessionId}`,
-        JSON.stringify({
-          sessionId: newSessionId,
-          userId,
-          botStepStatus: "QRCODE",
-        }),
+        JSON.stringify({ sessionId: newSessionId, userId, botStepStatus: "QRCODE" }),
         "EX",
         3600
       );
-      console.log(
-        `Recreated session ${newSessionId} for userId ${userId}, QR code:`,
-        qrCode.substring(0, 50) + "..."
-      );
-      await browser.close();
+      console.log(`Recreated session ${newSessionId} for userId ${userId}, QR code: ${qrCode.substring(0, 50)}...`);
       res.status(200).json({ sessionId: newSessionId, qrCode });
     } catch (error) {
-      console.error(
-        `Session recreation failed for userId ${userId}, sessionId ${sessionId}:`,
-        error
-      );
+      console.error(`Session recreation failed for userId ${userId}, sessionId ${sessionId}:`, error);
       res.status(500).json({ error: "Session recreation failed" });
     }
     return;
   }
 
   try {
-    const { browser, page } = await launchWhatsAppSession(
-      wsClients,
-      redis,
-      sessionId
-    );
+    const { page } = await launchWhatsAppSession(wsClients, redis, sessionId);
     const qrCode = await refreshWhatsAppPage(page);
-    console.log(
-      `Refreshed QR code for session ${sessionId}:`,
-      qrCode.substring(0, 50) + "..."
-    );
-    await browser.close();
+    console.log(`Refreshed QR code for session ${sessionId}: ${qrCode.substring(0, 50)}...`);
     res.status(200).json({ sessionId, qrCode });
   } catch (error) {
-    console.error(
-      `QR code refresh failed for sessionId ${sessionId}, userId ${userId}:`,
-      error
-    );
+    console.error(`QR code refresh failed for sessionId ${sessionId}, userId ${userId}:`, error);
     res.status(500).json({ error: "QR code refresh failed" });
   }
 };
@@ -189,7 +137,7 @@ export const refreshSession = async (
 export const getSession = async (
   req: Request,
   res: Response,
-  wsClients: Map<string, WebSocket>,
+  wsClients: Map<string, Set<WebSocket>>,
   redis: Redis
 ) => {
   const { id } = req.params;
@@ -210,41 +158,26 @@ export const getSession = async (
 
     let chats: { id: string; name: string; image: string }[] = [];
     if (session.botStepStatus === "AUTHENTICATED") {
-      const { browser, page } = await launchWhatsAppSession(
-        wsClients,
-        redis,
-        id
-      );
+      const { browser, page } = await launchWhatsAppSession(wsClients, redis, id);
       try {
-        await page.waitForSelector(
-          "#pane-side > div:nth-child(2) > div > div",
-          { timeout: 10000 }
-        );
+        await page.waitForSelector("[role='list']", { timeout: 30000 });
         chats = await page.evaluate(() => {
-          const chatElements = document.querySelectorAll(
-            "#pane-side > div:nth-child(2) > div > div > div.x10l6tqk.xh8yej3.x1g42fcv[role='listitem']"
-          );
+          const chatElements = document.querySelectorAll("[role='listitem']");
           const chatList: { id: string; name: string; image: string }[] = [];
           chatElements.forEach((element, index) => {
             if (index >= 10) return;
             const id = element.getAttribute("data-id") || `chat-${index}`;
             const nameElement = element.querySelector("span[title]");
-            const name = nameElement
-              ? nameElement.getAttribute("title") || "Unknown"
-              : "Unknown";
+            const name = nameElement ? nameElement.getAttribute("title") || "Unknown" : "Unknown";
             const imageElement = element.querySelector("img");
-            const image = imageElement
-              ? imageElement.src
-              : "https://placehold.co/600x400";
+            const image = imageElement ? imageElement.src : "https://placehold.co/600x400";
             chatList.push({ id, name, image });
           });
           return chatList;
         });
         console.log(`Fetched ${chats.length} chats for session ${id}`);
-      } catch (error: any) {
+      } catch (error) {
         console.error(`Failed to fetch chats for session ${id}:`, error);
-      } finally {
-        await browser.close();
       }
     }
 

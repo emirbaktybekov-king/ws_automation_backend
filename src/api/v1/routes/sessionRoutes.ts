@@ -9,7 +9,7 @@ import {
 import { authMiddleware } from "../middleware/authMiddleware";
 
 export default function sessionRoutes(
-  wsClients: Map<string, WebSocket>,
+  wsClients: Map<string, Set<WebSocket>>,
   redis: Redis
 ) {
   const router = Router();

@@ -1,25 +1,25 @@
 import express, { Express } from "express";
-import { WebSocketServer, WebSocket, CloseEvent } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 import dotenv from "dotenv";
 import cors from "cors";
 import v1Routes from "./api/v1";
 import Redis from "ioredis";
-import { launchWhatsAppSession } from "./puppeteer/sessionLauncher";
+import {
+  launchWhatsAppSession,
+  cleanupSession,
+} from "./puppeteer/sessionLauncher";
 
 dotenv.config();
 
 const app: Express = express();
 const port = process.env.PORT || 8000;
 
-// Initialize Redis client
 const redis = new Redis({
   host: process.env.REDIS_HOST || "localhost",
   port: parseInt(process.env.REDIS_PORT || "6379"),
-  password: process.env.REDIS_PASSWORD || undefined,
 });
 
-// Create Map for WebSocket clients
-const wsClients = new Map<string, WebSocket>();
+const wsClients = new Map<string, Set<WebSocket>>();
 
 app.use(
   cors({
@@ -49,145 +49,114 @@ wss.on("connection", (ws: WebSocket) => {
   ws.on("message", async (message) => {
     try {
       const data = JSON.parse(message.toString());
-      if (data.sessionId) {
-        wsClients.set(data.sessionId, ws);
-        console.log(`Registered WebSocket for session: ${data.sessionId}`);
-        // Check Redis for session status
-        const sessionData = await redis.get(
-          `whatsapp:session:${data.sessionId}`
-        );
+      const { sessionId } = data;
+      if (sessionId) {
+        if (!wsClients.has(sessionId)) wsClients.set(sessionId, new Set());
+        wsClients.get(sessionId)!.add(ws);
+        console.log(`Registered WebSocket for session: ${sessionId}`);
+
+        const sessionData = await redis.get(`whatsapp:session:${sessionId}`);
         if (sessionData) {
           const session = JSON.parse(sessionData);
           if (session.botStepStatus === "AUTHENTICATED") {
-            // Recreate Puppeteer instance for chat fetching
             const { browser, page } = await launchWhatsAppSession(
               wsClients,
               redis,
-              data.sessionId
+              sessionId
             );
             try {
+              await page.waitForSelector("[role='list']", { timeout: 60000 }); // Increased timeout
               const chats = await page.evaluate(() => {
                 const chats = Array.from(
-                  document.querySelectorAll(
-                    "#pane-side > div:nth-child(2) > div > div > div.x10l6tqk.xh8yej3.x1g42fcv[role='listitem']"
-                  )
+                  document.querySelectorAll("[role='listitem']")
                 ).slice(0, 10);
-                const chatList: { id: string; name: string; image: string }[] =
-                  [];
-                chats.forEach((element, index) => {
-                  const id = element.getAttribute("data-id") || `chat-${index}`;
-                  const nameElement = element.querySelector("span[title]");
-                  const name = nameElement
-                    ? nameElement.getAttribute("title") || "Unknown"
-                    : "Unknown";
-                  const imageElement = element.querySelector("img");
-                  const image = imageElement
-                    ? imageElement.src
-                    : "https://placehold.co/600x400";
-                  chatList.push({ id, name, image });
-                });
-                return chatList;
+                return chats.map((element, index) => ({
+                  id: element.getAttribute("data-id") || `chat-${index}`,
+                  name:
+                    element
+                      .querySelector("span[title]")
+                      ?.getAttribute("title") || "Unknown",
+                  image:
+                    element.querySelector("img")?.src ||
+                    "https://placehold.co/600x400",
+                }));
               });
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(
-                  JSON.stringify({
-                    sessionId: data.sessionId,
-                    status: "AUTHENTICATED",
-                    message: "Chats loaded",
-                    chats,
-                  })
-                );
-                console.log(`Resent chats for session ${data.sessionId}`);
-              }
-            } finally {
-              await browser.close();
+              wsClients.get(sessionId)?.forEach((client) => {
+                if (client.readyState === WebSocket.OPEN) {
+                  client.send(
+                    JSON.stringify({
+                      sessionId,
+                      status: "AUTHENTICATED",
+                      message: "Chats loaded",
+                      chats,
+                    })
+                  );
+                  console.log(
+                    `Sent chats for session ${sessionId}: ${chats.length} chats`
+                  );
+                }
+              });
+            } catch (error) {
+              console.error(
+                `Failed to fetch chats for session ${sessionId}:`,
+                error
+              );
             }
           }
         }
       }
+
       if (data.type === "select_chat" && data.sessionId && data.chatId) {
-        const chatId: string = data.chatId;
-        const sessionData = await redis.get(
-          `whatsapp:session:${data.sessionId}`
-        );
-        if (!sessionData) {
-          console.error(
-            `Session ${data.sessionId} not found in Redis for chat selection`
-          );
-          ws.send(
-            JSON.stringify({
-              type: "chat_selected",
-              sessionId: data.sessionId,
-              chatId,
-              success: false,
-              error: "Session not found",
-            })
-          );
-          return;
-        }
-        const session = JSON.parse(sessionData);
         const { browser, page } = await launchWhatsAppSession(
           wsClients,
           redis,
           data.sessionId
         );
         try {
-          let success = false;
-          for (let attempt = 1; attempt <= 3; attempt++) {
-            try {
-              success = await page.evaluate((chatId: string) => {
-                const chatElement = document.querySelector(
-                  `div[data-id="${chatId}"]`
-                );
-                if (chatElement) {
-                  (chatElement as HTMLElement).click();
-                  return true;
-                }
-                return false;
-              }, chatId);
-              if (success) {
-                console.log(
-                  `Clicked chat ${chatId} for session ${data.sessionId} on attempt ${attempt}`
-                );
-                ws.send(
-                  JSON.stringify({
-                    type: "chat_selected",
-                    sessionId: data.sessionId,
-                    chatId,
-                    success: true,
-                  })
-                );
-                break;
-              } else {
-                console.warn(
-                  `Chat ${chatId} not found for session ${data.sessionId} on attempt ${attempt}`
-                );
-                await new Promise((resolve) => setTimeout(resolve, 1000));
-              }
-            } catch (err: any) {
-              console.error(
-                `Failed to click chat ${chatId} for session ${data.sessionId} on attempt ${attempt}:`,
-                err.message
-              );
-              await new Promise((resolve) => setTimeout(resolve, 1000));
+          const success = await page.evaluate((chatId: string) => {
+            const chatElement = document.querySelector(
+              `div[data-id="${chatId}"]`
+            );
+            if (chatElement) {
+              (chatElement as HTMLElement).click();
+              return true;
             }
-          }
-          if (!success) {
-            console.error(
-              `Failed to click chat ${chatId} for session ${data.sessionId} after 3 attempts`
-            );
-            ws.send(
-              JSON.stringify({
-                type: "chat_selected",
-                sessionId: data.sessionId,
-                chatId,
-                success: false,
-                error: "Chat not found or failed to click",
-              })
-            );
-          }
-        } finally {
-          await browser.close();
+            return false;
+          }, data.chatId);
+          wsClients.get(data.sessionId)?.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(
+                JSON.stringify({
+                  type: "chat_selected",
+                  sessionId: data.sessionId,
+                  chatId: data.chatId,
+                  success,
+                  error: success ? undefined : "Chat not found",
+                })
+              );
+            }
+          });
+          console.log(
+            `Chat selection ${success ? "succeeded" : "failed"} for chat ${data.chatId} in session ${data.sessionId}`
+          );
+        } catch (error) {
+          console.error(
+            `Failed to select chat ${data.chatId} for session ${data.sessionId}:`,
+            error
+          );
+          wsClients.get(data.sessionId)?.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(
+                JSON.stringify({
+                  type: "chat_selected",
+                  sessionId: data.sessionId,
+                  chatId: data.chatId,
+                  success: false,
+                  error: "Failed to click chat",
+                })
+              );
+            }
+          });
         }
       }
     } catch (e) {
@@ -195,29 +164,33 @@ wss.on("connection", (ws: WebSocket) => {
     }
   });
 
-  ws.on("close", async (event: CloseEvent) => {
-    console.log(
-      `WebSocket client disconnected: code=${event.code}, reason=${event.reason}`
-    );
-    for (const [sessionId, client] of wsClients.entries()) {
-      if (client === ws) {
-        wsClients.delete(sessionId);
-        console.log(`Removed WebSocket client for session: ${sessionId}`);
-        break;
+  ws.on("close", async () => {
+    console.log("WebSocket client disconnected");
+    for (const [sessionId, clients] of wsClients.entries()) {
+      if (clients.has(ws)) {
+        clients.delete(ws);
+        if (clients.size === 0) {
+          wsClients.delete(sessionId);
+          await cleanupSession(sessionId);
+          console.log(
+            `Cleaned up session ${sessionId} due to no active clients`
+          );
+        }
       }
     }
   });
 });
 
-// Mount routes explicitly to avoid invalid paths
 app.use("/api/v1", v1Routes(wsClients, redis));
 
 app.get("/", (req, res) => {
   res.status(200).json({ message: "WhatsApp Automation Backend" });
 });
 
-// Cleanup Redis connection on server shutdown
 process.on("SIGTERM", async () => {
+  for (const sessionId of wsClients.keys()) {
+    await cleanupSession(sessionId);
+  }
   await redis.quit();
   server.close(() => {
     console.log("Server shut down");
